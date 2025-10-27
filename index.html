@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CSV Health Log Plotter</title>
+    <!-- 
+        CSV Data Plotter - Health Log Visualization Tool
+        Version: 1.1
+        Last Updated: 2025-10-27
+        Features: Multi-series plotting, dual Y-axis, power data integration, X-axis zoom
+    -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.2/papaparse.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2em;
+            margin-bottom: 10px;
+        }
+        
+        .content {
+            padding: 30px;
+        }
+        
+        .upload-section {
+            border: 3px dashed #667eea;
+            border-radius: 8px;
+            padding: 40px;
+            text-align: center;
+            margin-bottom: 30px;
+            background: #f8f9ff;
+            transition: all 0.3s;
+        }
+        
+        .upload-section:hover {
+            border-color: #764ba2;
+            background: #f0f2ff;
+        }
+        
+        .upload-section.dragover {
+            border-color: #764ba2;
+            background: #e8ebff;
+            transform: scale(1.02);
+        }
+        
+        .upload-section.secondary {
+            border-color: #f59e0b;
+            background: #fffbeb;
+        }
+        
+        .upload-section.secondary:hover {
+            border-color: #d97706;
+            background: #fef3c7;
+        }
+        
+        input[type="file"] {
+            display: none;
+        }
+        
+        .upload-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 12px 30px;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        
+        .upload-btn.secondary {
+            background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+        }
+        
+        .upload-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        .controls {
+            display: none;
+            background: #f8f9ff;
+            padding: 25px;
+            border-radius: 8px;
+            margin-bottom: 30px;
+        }
+        
+        .controls.visible {
+            display: block;
+        }
+        
+        .control-group {
+            margin-bottom: 20px;
+        }
+        
+        .control-group label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: #333;
+        }
+        
+        select {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 6px;
+            font-size: 14px;
+            background: white;
+            cursor: pointer;
+            transition: border-color 0.3s;
+        }
+        
+        select[multiple] {
+            min-height: 150px;
+        }
+        
+        select[multiple] option {
+            padding: 8px;
+            margin: 2px 0;
+        }
+        
+        select[multiple] option:checked {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        
+        select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .chart-type-group {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        
+        .chart-type-btn {
+            flex: 1;
+            min-width: 100px;
+            padding: 10px 20px;
+            border: 2px solid #ddd;
+            background: white;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-size: 14px;
+        }
+        
+        .chart-type-btn:hover {
+            border-color: #667eea;
+        }
+        
+        .chart-type-btn.active {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-color: #667eea;
+        }
+        
+        .chart-container {
+            display: none;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            position: relative;
+            height: 800px;
+        }
+        
+        .chart-container.visible {
+            display: block;
+        }
+        
+        .file-info {
+            display: none;
+            background: #e8f5e9;
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            border-left: 4px solid #4caf50;
+        }
+        
+        .file-info.visible {
+            display: block;
+        }
+        
+        .file-info p {
+            margin: 5px 0;
+            color: #2e7d32;
+        }
+        
+        .file-info.power {
+            background: #fff7ed;
+            border-left: 4px solid #f59e0b;
+        }
+        
+        .file-info.power p {
+            color: #92400e;
+        }
+        
+        .error {
+            background: #ffebee;
+            color: #c62828;
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            border-left: 4px solid #c62828;
+            display: none;
+        }
+        
+        .error.visible {
+            display: block;
+        }
+        
+        .zoom-overlay {
+            position: absolute;
+            background: rgba(102, 126, 234, 0.2);
+            border: 2px solid #667eea;
+            pointer-events: none;
+            display: none;
+        }
+        
+        .zoom-controls {
+            display: none;
+            margin-top: 15px;
+            text-align: center;
+        }
+        
+        .zoom-controls.visible {
+            display: block;
+        }
+        
+        .zoom-btn {
+            background: #667eea;
+            color: white;
+            padding: 8px 20px;
+            border: none;
+            border-radius: 6px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin: 0 5px;
+        }
+        
+        .zoom-btn:hover {
+            background: #764ba2;
+            transform: translateY(-1px);
+        }
+        
+        .zoom-info {
+            display: none;
+            background: #e3f2fd;
+            color: #1565c0;
+            padding: 10px;
+            border-radius: 6px;
+            margin-bottom: 15px;
+            text-align: center;
+            font-size: 14px;
+        }
+        
+        .zoom-info.visible {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📊 Health Log Visualization Tool</h1>
+            <p>Upload Health Log and visualize data</p>
+        </div>
+        
+        <div class="content">
+            <div class="upload-section" id="uploadSection">
+                <h2>📁 Upload System CSV Health Log</h2>
+                <p style="margin: 15px 0; color: #666;">Drag and drop your CSV Health Log here or click to browse</p>
+                <label for="fileInput" class="upload-btn">Choose File</label>
+                <input type="file" id="fileInput" accept=".csv">
+            </div>
+            
+            <div class="upload-section secondary" id="uploadSection2" style="display: none;">
+                <h2>⚡ Upload BK Precision File</h2>
+                <p style="margin: 15px 0; color: #666;">Optional: Upload BK Precision Log File</p>
+                <label for="fileInput2" class="upload-btn secondary">Choose Power CSV</label>
+                <input type="file" id="fileInput2" accept=".csv">
+            </div>
+            
+            <div class="error" id="errorMsg"></div>
+            <div class="file-info" id="fileInfo"></div>
+            <div class="file-info power" id="fileInfo2"></div>
+            
+            <div class="zoom-info" id="zoomInfo">
+                💡 Tip: Hold <strong>Shift</strong> and drag on the chart to zoom into a specific X-axis range
+            </div>
+            
+            <div class="controls" id="controls">
+                <div class="control-group">
+                    <label for="xAxis">X-Axis (Independent Variable):</label>
+                    <select id="xAxis"></select>
+                </div>
+                
+                <div class="control-group">
+                    <label for="yAxis">Y-Axis (Dependent Variables - hold Ctrl/Cmd to select multiple):</label>
+                    <select id="yAxis" multiple size="8"></select>
+                </div>
+                
+                <div class="control-group">
+                    <label>Chart Type:</label>
+                    <div class="chart-type-group">
+                        <button class="chart-type-btn active" data-type="line">Line</button>
+                        <button class="chart-type-btn" data-type="scatter">Scatter</button>
+                        <button class="chart-type-btn" data-type="bar">Bar</button>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="chart-container" id="chartContainer">
+                <canvas id="chart"></canvas>
+                <div class="zoom-overlay" id="zoomOverlay"></div>
+            </div>
+            
+            <div class="zoom-controls" id="zoomControls">
+                <button class="zoom-btn" id="resetZoomBtn">Reset Zoom</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let csvData = null;
+        let powerData = null;
+        let chartInstance = null;
+        let currentChartType = 'line';
+        let xAxisRange = null; // Store zoom range: { min: number, max: number }
+        let isSelecting = false;
+        let selectionStart = null;
+        
+        const fileInput = document.getElementById('fileInput');
+        const fileInput2 = document.getElementById('fileInput2');
+        const uploadSection = document.getElementById('uploadSection');
+        const uploadSection2 = document.getElementById('uploadSection2');
+        const controls = document.getElementById('controls');
+        const chartContainer = document.getElementById('chartContainer');
+        const xAxisSelect = document.getElementById('xAxis');
+        const yAxisSelect = document.getElementById('yAxis');
+        const fileInfo = document.getElementById('fileInfo');
+        const fileInfo2 = document.getElementById('fileInfo2');
+        const errorMsg = document.getElementById('errorMsg');
+        const zoomOverlay = document.getElementById('zoomOverlay');
+        const zoomControls = document.getElementById('zoomControls');
+        const resetZoomBtn = document.getElementById('resetZoomBtn');
+        const zoomInfo = document.getElementById('zoomInfo');
+        
+        // File input change
+        fileInput.addEventListener('change', (e) => handleFileSelect(e, 'primary'));
+        fileInput2.addEventListener('change', (e) => handleFileSelect(e, 'power'));
+        
+        // Drag and drop for primary
+        uploadSection.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadSection.classList.add('dragover');
+        });
+        
+        uploadSection.addEventListener('dragleave', () => {
+            uploadSection.classList.remove('dragover');
+        });
+        
+        uploadSection.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadSection.classList.remove('dragover');
+            const file = e.dataTransfer.files[0];
+            if (file && file.name.endsWith('.csv')) {
+                processFile(file, 'primary');
+            } else {
+                showError('Please drop a valid CSV file');
+            }
+        });
+        
+        // Drag and drop for power
+        uploadSection2.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadSection2.classList.add('dragover');
+        });
+        
+        uploadSection2.addEventListener('dragleave', () => {
+            uploadSection2.classList.remove('dragover');
+        });
+        
+        uploadSection2.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadSection2.classList.remove('dragover');
+            const file = e.dataTransfer.files[0];
+            if (file && file.name.endsWith('.csv')) {
+                processFile(file, 'power');
+            } else {
+                showError('Please drop a valid CSV file');
+            }
+        });
+        
+        // Chart type buttons
+        document.querySelectorAll('.chart-type-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('.chart-type-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                currentChartType = btn.dataset.type;
+                updateChart();
+            });
+        });
+        
+        // Axis selection change
+        xAxisSelect.addEventListener('change', updateChart);
+        yAxisSelect.addEventListener('change', updateChart);
+        
+        // Reset zoom button
+        resetZoomBtn.addEventListener('click', () => {
+            xAxisRange = null;
+            zoomControls.classList.remove('visible');
+            updateChart();
+        });
+        
+        // Chart zoom selection with Shift+Drag
+        const canvas = document.getElementById('chart');
+        canvas.addEventListener('mousedown', (e) => {
+            if (e.shiftKey && chartInstance) {
+                isSelecting = true;
+                const rect = canvas.getBoundingClientRect();
+                selectionStart = e.clientX - rect.left;
+                zoomOverlay.style.display = 'block';
+                zoomOverlay.style.left = selectionStart + 'px';
+                zoomOverlay.style.top = '0';
+                zoomOverlay.style.width = '0';
+                zoomOverlay.style.height = rect.height + 'px';
+            }
+        });
+        
+        canvas.addEventListener('mousemove', (e) => {
+            if (isSelecting && e.shiftKey) {
+                const rect = canvas.getBoundingClientRect();
+                const currentX = e.clientX - rect.left;
+                const width = Math.abs(currentX - selectionStart);
+                const left = Math.min(currentX, selectionStart);
+                
+                zoomOverlay.style.left = left + 'px';
+                zoomOverlay.style.width = width + 'px';
+            }
+        });
+        
+        canvas.addEventListener('mouseup', (e) => {
+            if (isSelecting && e.shiftKey) {
+                const rect = canvas.getBoundingClientRect();
+                const endX = e.clientX - rect.left;
+                
+                // Get X-axis values from pixel positions
+                const xScale = chartInstance.scales.x;
+                const xStart = xScale.getValueForPixel(Math.min(selectionStart, endX));
+                const xEnd = xScale.getValueForPixel(Math.max(selectionStart, endX));
+                
+                // Only zoom if selection is wide enough
+                if (Math.abs(endX - selectionStart) > 20) {
+                    xAxisRange = { min: xStart, max: xEnd };
+                    zoomControls.classList.add('visible');
+                    updateChart();
+                }
+                
+                isSelecting = false;
+                zoomOverlay.style.display = 'none';
+            }
+        });
+        
+        canvas.addEventListener('mouseleave', () => {
+            if (isSelecting) {
+                isSelecting = false;
+                zoomOverlay.style.display = 'none';
+            }
+        });
+        
+        function handleFileSelect(e, type) {
+            const file = e.target.files[0];
+            if (file) {
+                processFile(file, type);
+            }
+        }
+        
+        function processFile(file, type) {
+            errorMsg.classList.remove('visible');
+            
+            if (type === 'power') {
+                // Custom parsing for power CSV
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    const text = e.target.result;
+                    parsePowerCSV(text, file.name);
+                };
+                reader.readAsText(file);
+            } else {
+                Papa.parse(file, {
+                    header: true,
+                    dynamicTyping: false,
+                    skipEmptyLines: true,
+                    delimitersToGuess: [',', '\t', '|', ';'],
+                    complete: (results) => {
+                        const criticalErrors = results.errors.filter(e => e.type === 'Delimiter');
+                        if (criticalErrors.length > 0) {
+                            showError('Error parsing CSV: ' + criticalErrors[0].message);
+                            return;
+                        }
+                        
+                        csvData = results.data;
+                        const headers = Object.keys(csvData[0]);
+                        
+                        if (headers.length === 0) {
+                            showError('No columns found in CSV file');
+                            return;
+                        }
+                        
+                        populateAxisSelects(headers);
+                        showFileInfo(file.name, csvData.length, headers.length, 'primary');
+                        controls.classList.add('visible');
+                        uploadSection2.style.display = 'block';
+                        zoomInfo.classList.add('visible');
+                        updateChart();
+                    },
+                    error: (error) => {
+                        showError('Error reading file: ' + error.message);
+                    }
+                });
+            }
+        }
+        
+        function parsePowerCSV(text, filename) {
+            const lines = text.split('\n');
+            const parsed = [];
+            
+            for (let line of lines) {
+                // Match lines like: (13:12:48.661),[0.5575747],OUTPUT,=,12.002,V,1.237,A
+                const match = line.match(/\((\d+):(\d+):(\d+\.\d+)\),\[([^\]]+)\],OUTPUT,=,([^,]+),V,([^,]+),A/);
+                if (match) {
+                    const hours = parseInt(match[1]);
+                    const minutes = parseInt(match[2]);
+                    const seconds = parseFloat(match[3]);
+                    const voltage = parseFloat(match[5]);
+                    const current = parseFloat(match[6]);
+                    const power = voltage * current;
+                    
+                    // Create timestamp for today with the time from the data
+                    const now = new Date();
+                    const timestamp = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 
+                                               hours, minutes, Math.floor(seconds), 
+                                               (seconds % 1) * 1000).getTime();
+                    
+                    parsed.push({
+                        timestamp: timestamp,
+                        voltage: voltage,
+                        current: current,
+                        power: power
+                    });
+                }
+            }
+            
+            if (parsed.length === 0) {
+                showError('No valid power data found in CSV');
+                return;
+            }
+            
+            powerData = parsed;
+            showFileInfo(filename, parsed.length, 4, 'power');
+            updateChart();
+        }
+        
+        function populateAxisSelects(headers) {
+            xAxisSelect.innerHTML = '';
+            yAxisSelect.innerHTML = '';
+            
+            let defaultX = headers[0];
+            const dateTimeCol = headers.find(h => h.toLowerCase().includes('datetime') || h.toLowerCase().includes('time'));
+            if (dateTimeCol) defaultX = dateTimeCol;
+            
+            const tempColumns = headers.filter(h => h.toLowerCase().includes('temp'));
+            const defaultYColumns = [];
+            if (tempColumns.length > 0) {
+                const iccdTemp = tempColumns.find(h => h.toLowerCase().includes('iccd'));
+                if (iccdTemp) defaultYColumns.push(iccdTemp);
+                const baseplateTemp = tempColumns.find(h => h.toLowerCase().includes('baseplate'));
+                if (baseplateTemp) defaultYColumns.push(baseplateTemp);
+                if (defaultYColumns.length === 0) defaultYColumns.push(tempColumns[0]);
+            } else {
+                defaultYColumns.push(headers[1]);
+            }
+            
+            headers.forEach(header => {
+                const optionX = document.createElement('option');
+                optionX.value = header;
+                optionX.textContent = header;
+                xAxisSelect.appendChild(optionX);
+                
+                const optionY = document.createElement('option');
+                optionY.value = header;
+                optionY.textContent = header;
+                if (defaultYColumns.includes(header)) {
+                    optionY.selected = true;
+                }
+                yAxisSelect.appendChild(optionY);
+            });
+            
+            xAxisSelect.value = defaultX;
+        }
+        
+        function updateChart() {
+            if (!csvData) return;
+            
+            const xColumn = xAxisSelect.value;
+            const yColumns = Array.from(yAxisSelect.selectedOptions).map(opt => opt.value);
+            
+            if (!xColumn || yColumns.length === 0) return;
+            
+            const isTimeAxis = xColumn.toLowerCase().includes('datetime') || xColumn.toLowerCase().includes('time');
+            
+            if (chartInstance) {
+                chartInstance.destroy();
+            }
+            
+            const ctx = document.getElementById('chart').getContext('2d');
+            
+            // Color palette for multiple series
+            const colors = [
+                { border: '#667eea', bg: 'rgba(102, 126, 234, 0.1)' },
+                { border: '#06b6d4', bg: 'rgba(6, 182, 212, 0.1)' },
+                { border: '#10b981', bg: 'rgba(16, 185, 129, 0.1)' },
+                { border: '#8b5cf6', bg: 'rgba(139, 92, 246, 0.1)' },
+                { border: '#ec4899', bg: 'rgba(236, 72, 153, 0.1)' },
+                { border: '#f97316', bg: 'rgba(249, 115, 22, 0.1)' }
+            ];
+            
+            const datasets = [];
+            let allYValues = [];
+            
+            // Create datasets for each selected Y column
+            yColumns.forEach((yColumn, index) => {
+                const data = csvData.map((row, rowIndex) => {
+                    let xVal = row[xColumn];
+                    let yVal = row[yColumn];
+                    
+                    if (isTimeAxis) {
+                        const date = new Date(xVal);
+                        xVal = isNaN(date.getTime()) ? rowIndex : date.getTime();
+                    } else {
+                        xVal = parseFloat(xVal);
+                    }
+                    
+                    yVal = parseFloat(yVal);
+                    
+                    return { x: xVal, y: yVal };
+                }).filter(point => 
+                    point.x != null && 
+                    point.y != null && 
+                    !isNaN(point.x) && 
+                    !isNaN(point.y) &&
+                    isFinite(point.x) &&
+                    isFinite(point.y) &&
+                    // Filter by zoom range if active
+                    (!xAxisRange || (point.x >= xAxisRange.min && point.x <= xAxisRange.max))
+                );
+                
+                if (data.length > 0) {
+                    const colorIndex = index % colors.length;
+                    datasets.push({
+                        label: yColumn,
+                        data: data,
+                        borderColor: colors[colorIndex].border,
+                        backgroundColor: colors[colorIndex].bg,
+                        borderWidth: 2,
+                        pointRadius: currentChartType === 'scatter' ? 4 : 2,
+                        pointHoverRadius: 6,
+                        tension: 0.1,
+                        yAxisID: 'y'
+                    });
+                    
+                    allYValues.push(...data.map(d => d.y));
+                }
+            });
+            
+            if (allYValues.length === 0) {
+                showError('No valid data points found for selected columns');
+                return;
+            }
+            
+            // Calculate Y-axis range with 10% buffer for all series
+            const yMin = Math.min(...allYValues);
+            const yMax = Math.max(...allYValues);
+            const yRange = yMax - yMin;
+            const yBuffer = yRange * 0.1;
+            
+            const scales = {
+                x: {
+                    type: 'linear',
+                    title: {
+                        display: true,
+                        text: xColumn
+                    },
+                    min: xAxisRange ? xAxisRange.min : undefined,
+                    max: xAxisRange ? xAxisRange.max : undefined,
+                    ticks: isTimeAxis ? {
+                        callback: function(value) {
+                            const date = new Date(value);
+                            return date.toLocaleTimeString();
+                        }
+                    } : undefined
+                },
+                y: {
+                    type: 'linear',
+                    position: 'left',
+                    title: {
+                        display: true,
+                        text: yColumns.length === 1 ? yColumns[0] : 'Values'
+                    },
+                    min: yMin - yBuffer,
+                    max: yMax + yBuffer
+                }
+            };
+            
+            // Add power data if available
+            if (powerData && powerData.length > 0) {
+                const powerDataPoints = powerData.map(p => ({
+                    x: p.timestamp,
+                    y: p.power
+                })).filter(point => 
+                    !xAxisRange || (point.x >= xAxisRange.min && point.x <= xAxisRange.max)
+                );
+                
+                if (powerDataPoints.length > 0) {
+                    const powerValues = powerDataPoints.map(d => d.y);
+                    const powerMin = Math.min(...powerValues);
+                    const powerMax = Math.max(...powerValues);
+                    const powerRange = powerMax - powerMin;
+                    const powerBuffer = powerRange * 0.1;
+                    
+                    datasets.push({
+                        label: 'Power (W)',
+                        data: powerDataPoints,
+                        borderColor: '#f59e0b',
+                        backgroundColor: 'rgba(245, 158, 11, 0.1)',
+                        borderWidth: 2,
+                        pointRadius: currentChartType === 'scatter' ? 4 : 2,
+                        pointHoverRadius: 6,
+                        tension: 0.1,
+                        yAxisID: 'y2'
+                    });
+                    
+                    scales.y2 = {
+                        type: 'linear',
+                        position: 'right',
+                        title: {
+                            display: true,
+                            text: 'Power (W)'
+                        },
+                        min: powerMin - powerBuffer,
+                        max: powerMax + powerBuffer,
+                        grid: {
+                            drawOnChartArea: false
+                        }
+                    };
+                }
+            }
+            
+            const config = {
+                type: currentChartType,
+                data: { datasets: datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: {
+                        mode: 'index',
+                        intersect: false
+                    },
+                    plugins: {
+                        legend: {
+                            display: true,
+                            position: 'top'
+                        },
+                        tooltip: {
+                            callbacks: {
+                                title: function(context) {
+                                    if (isTimeAxis) {
+                                        const date = new Date(context[0].parsed.x);
+                                        return date.toLocaleString();
+                                    }
+                                    return context[0].parsed.x;
+                                }
+                            }
+                        }
+                    },
+                    scales: scales
+                }
+            };
+            
+            chartInstance = new Chart(ctx, config);
+            chartContainer.classList.add('visible');
+        }
+        
+        function showFileInfo(filename, rows, cols, type) {
+            const info = type === 'power' ? fileInfo2 : fileInfo;
+            info.innerHTML = `
+                <p><strong>File:</strong> ${filename}</p>
+                <p><strong>Rows:</strong> ${rows} | <strong>Columns:</strong> ${cols}</p>
+            `;
+            info.classList.add('visible');
+        }
+        
+        function showError(message) {
+            errorMsg.textContent = message;
+            errorMsg.classList.add('visible');
+        }
+    </script>
+</body>
+</html>
