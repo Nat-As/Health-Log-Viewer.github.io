@@ -7,9 +7,11 @@
     <title>CSV Health Log Plotter</title>
     <!-- 
         CSV Data Plotter - Health Log Visualization Tool
-        Version: 1.1
-        Last Updated: 2025-10-27
-        Features: Multi-series plotting, dual Y-axis, power data integration, X-axis zoom
+        Version: 1.2
+        Last Updated: 2026-11-12
+        Features: Multi-series plotting, field type detection with unit-aware dual Y-axes,
+                  boolean/state scaling, idle-gap collapsing on the time axis,
+                  power data integration, X-axis zoom, decimation for large logs
     -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.2/papaparse.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
@@ -292,6 +294,27 @@
         .zoom-info.visible {
             display: block;
         }
+
+        .hint {
+            margin-top: 6px;
+            font-size: 13px;
+            color: #555;
+        }
+
+        .notice {
+            display: none;
+            background: #fffbeb;
+            color: #92400e;
+            padding: 10px 15px;
+            border-radius: 6px;
+            margin-bottom: 15px;
+            border-left: 4px solid #f59e0b;
+            font-size: 14px;
+        }
+
+        .notice.visible {
+            display: block;
+        }
     </style>
 </head>
 <body>
@@ -335,6 +358,21 @@
                     <select id="yAxis" multiple size="8"></select>
                 </div>
                 
+                <div class="control-group" id="gapGroup">
+                    <label for="gapMode">Collapse idle gaps (time axis):</label>
+                    <select id="gapMode">
+                        <option value="auto" selected>Auto</option>
+                        <option value="off">Off (true time scale)</option>
+                        <option value="30000">Gaps longer than 30 s</option>
+                        <option value="60000">Gaps longer than 1 min</option>
+                        <option value="300000">Gaps longer than 5 min</option>
+                        <option value="900000">Gaps longer than 15 min</option>
+                        <option value="3600000">Gaps longer than 1 hour</option>
+                        <option value="86400000">Gaps longer than 1 day</option>
+                    </select>
+                    <p class="hint" id="gapSummary"></p>
+                </div>
+
                 <div class="control-group">
                     <label>Chart Type:</label>
                     <div class="chart-type-group">
@@ -345,6 +383,8 @@
                 </div>
             </div>
             
+            <div class="notice" id="chartNotice"></div>
+
             <div class="chart-container" id="chartContainer">
                 <canvas id="chart"></canvas>
                 <div class="zoom-overlay" id="zoomOverlay"></div>
@@ -357,14 +397,72 @@
     </div>
 
     <script>
+        // ================================================================
+        // State
+        // ================================================================
         let csvData = null;
+        let csvHeaders = [];
+        let fieldInfo = {};               // column name -> detected type info
+        let valueCache = new Map();       // column name -> Float64Array of plottable values
         let powerData = null;
         let chartInstance = null;
         let currentChartType = 'line';
-        let xAxisRange = null; // Store zoom range: { min: number, max: number }
+        let xAxisRange = null;            // Zoom range in axis coordinates: { min, max }
+        let xAxisRangeKey = null;         // Which axis mapping the zoom range belongs to
         let isSelecting = false;
         let selectionStart = null;
-        
+        let activeTimeline = null;        // Collapsed time axis mapping used by the current chart
+        let timelineCache = { key: null, value: null };
+        let seriesMeta = [];              // Per-dataset info used by tooltips / interaction
+
+        const DAY = 86400000;
+        const MAX_STATES = 16;            // Max distinct text values to treat a column as a state/enum
+        const MISSING = new Set(['', 'nan', 'null', 'n/a', 'na']);
+
+        // Unit inference from column-name suffixes. Columns sharing a key share an axis.
+        const UNIT_RULES = [
+            { re: /(_degc|_c)$/i,        key: 'temp_c',  label: 'Temperature', symbol: '°C' },
+            { re: /(_degf|_f)$/i,        key: 'temp_f',  label: 'Temperature', symbol: '°F' },
+            { re: /_mv$/i,               key: 'mv',      label: 'Voltage',     symbol: 'mV' },
+            { re: /_v$/i,                key: 'v',       label: 'Voltage',     symbol: 'V' },
+            { re: /_ma$/i,               key: 'ma',      label: 'Current',     symbol: 'mA' },
+            { re: /_a$/i,                key: 'a',       label: 'Current',     symbol: 'A' },
+            { re: /_mw$/i,               key: 'mw',      label: 'Power',       symbol: 'mW' },
+            { re: /_w$/i,                key: 'w',       label: 'Power',       symbol: 'W' },
+            { re: /_mm$/i,               key: 'mm',      label: 'Distance',    symbol: 'mm' },
+            { re: /_km$/i,               key: 'km',      label: 'Distance',    symbol: 'km' },
+            { re: /_m$/i,                key: 'm',       label: 'Distance',    symbol: 'm' },
+            { re: /_ms$/i,               key: 'ms',      label: 'Duration',    symbol: 'ms' },
+            { re: /_s$/i,                key: 's',       label: 'Duration',    symbol: 's' },
+            { re: /_khz$/i,              key: 'khz',     label: 'Frequency',   symbol: 'kHz' },
+            { re: /_hz$/i,               key: 'hz',      label: 'Frequency',   symbol: 'Hz' },
+            { re: /(_%|_pct|_percent)$/i, key: 'pct',    label: 'Percent',     symbol: '%' },
+            { re: /^(lat|lon|lng)$|latitude|longitude/i, key: 'deg', label: 'Coordinate', symbol: '°' },
+            { re: /temp(erature)?$/i,    key: 'temp',    label: 'Temperature', symbol: '' }
+        ];
+        const POWER_UNIT = { key: 'w', label: 'Power', symbol: 'W' };
+
+        const TIME_STEPS = [
+            1e3, 2e3, 5e3, 10e3, 15e3, 30e3,
+            60e3, 120e3, 300e3, 600e3, 900e3, 1800e3,
+            3600e3, 7200e3, 10800e3, 21600e3, 43200e3,
+            DAY, 2 * DAY, 7 * DAY, 14 * DAY, 30 * DAY
+        ];
+
+        const COLORS = [
+            { border: '#667eea', bg: 'rgba(102, 126, 234, 0.1)' },
+            { border: '#06b6d4', bg: 'rgba(6, 182, 212, 0.1)' },
+            { border: '#10b981', bg: 'rgba(16, 185, 129, 0.1)' },
+            { border: '#8b5cf6', bg: 'rgba(139, 92, 246, 0.1)' },
+            { border: '#ec4899', bg: 'rgba(236, 72, 153, 0.1)' },
+            { border: '#ef4444', bg: 'rgba(239, 68, 68, 0.1)' },
+            { border: '#84cc16', bg: 'rgba(132, 204, 22, 0.1)' },
+            { border: '#0ea5e9', bg: 'rgba(14, 165, 233, 0.1)' },
+            { border: '#a16207', bg: 'rgba(161, 98, 7, 0.1)' },
+            { border: '#475569', bg: 'rgba(71, 85, 105, 0.1)' }
+        ];
+        const POWER_COLOR = { border: '#f59e0b', bg: 'rgba(245, 158, 11, 0.1)' };
+
         const fileInput = document.getElementById('fileInput');
         const fileInput2 = document.getElementById('fileInput2');
         const uploadSection = document.getElementById('uploadSection');
@@ -373,61 +471,46 @@
         const chartContainer = document.getElementById('chartContainer');
         const xAxisSelect = document.getElementById('xAxis');
         const yAxisSelect = document.getElementById('yAxis');
+        const gapModeSelect = document.getElementById('gapMode');
+        const gapGroup = document.getElementById('gapGroup');
+        const gapSummary = document.getElementById('gapSummary');
         const fileInfo = document.getElementById('fileInfo');
         const fileInfo2 = document.getElementById('fileInfo2');
         const errorMsg = document.getElementById('errorMsg');
+        const chartNotice = document.getElementById('chartNotice');
         const zoomOverlay = document.getElementById('zoomOverlay');
         const zoomControls = document.getElementById('zoomControls');
         const resetZoomBtn = document.getElementById('resetZoomBtn');
         const zoomInfo = document.getElementById('zoomInfo');
-        
-        // File input change
+
+        // ================================================================
+        // Event wiring
+        // ================================================================
         fileInput.addEventListener('change', (e) => handleFileSelect(e, 'primary'));
         fileInput2.addEventListener('change', (e) => handleFileSelect(e, 'power'));
-        
-        // Drag and drop for primary
-        uploadSection.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            uploadSection.classList.add('dragover');
-        });
-        
-        uploadSection.addEventListener('dragleave', () => {
-            uploadSection.classList.remove('dragover');
-        });
-        
-        uploadSection.addEventListener('drop', (e) => {
-            e.preventDefault();
-            uploadSection.classList.remove('dragover');
-            const file = e.dataTransfer.files[0];
-            if (file && file.name.endsWith('.csv')) {
-                processFile(file, 'primary');
-            } else {
-                showError('Please drop a valid CSV file');
-            }
-        });
-        
-        // Drag and drop for power
-        uploadSection2.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            uploadSection2.classList.add('dragover');
-        });
-        
-        uploadSection2.addEventListener('dragleave', () => {
-            uploadSection2.classList.remove('dragover');
-        });
-        
-        uploadSection2.addEventListener('drop', (e) => {
-            e.preventDefault();
-            uploadSection2.classList.remove('dragover');
-            const file = e.dataTransfer.files[0];
-            if (file && file.name.endsWith('.csv')) {
-                processFile(file, 'power');
-            } else {
-                showError('Please drop a valid CSV file');
-            }
-        });
-        
-        // Chart type buttons
+
+        function wireDropZone(section, type) {
+            section.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                section.classList.add('dragover');
+            });
+            section.addEventListener('dragleave', () => {
+                section.classList.remove('dragover');
+            });
+            section.addEventListener('drop', (e) => {
+                e.preventDefault();
+                section.classList.remove('dragover');
+                const file = e.dataTransfer.files[0];
+                if (file && file.name.toLowerCase().endsWith('.csv')) {
+                    processFile(file, type);
+                } else {
+                    showError('Please drop a valid CSV file');
+                }
+            });
+        }
+        wireDropZone(uploadSection, 'primary');
+        wireDropZone(uploadSection2, 'power');
+
         document.querySelectorAll('.chart-type-btn').forEach(btn => {
             btn.addEventListener('click', () => {
                 document.querySelectorAll('.chart-type-btn').forEach(b => b.classList.remove('active'));
@@ -436,18 +519,17 @@
                 updateChart();
             });
         });
-        
-        // Axis selection change
+
         xAxisSelect.addEventListener('change', updateChart);
         yAxisSelect.addEventListener('change', updateChart);
-        
-        // Reset zoom button
+        gapModeSelect.addEventListener('change', updateChart);
+
         resetZoomBtn.addEventListener('click', () => {
             xAxisRange = null;
             zoomControls.classList.remove('visible');
             updateChart();
         });
-        
+
         // Chart zoom selection with Shift+Drag
         const canvas = document.getElementById('chart');
         canvas.addEventListener('mousedown', (e) => {
@@ -456,156 +538,684 @@
                 const rect = canvas.getBoundingClientRect();
                 selectionStart = e.clientX - rect.left;
                 zoomOverlay.style.display = 'block';
-                zoomOverlay.style.left = selectionStart + 'px';
-                zoomOverlay.style.top = '0';
+                zoomOverlay.style.left = (canvas.offsetLeft + selectionStart) + 'px';
+                zoomOverlay.style.top = canvas.offsetTop + 'px';
                 zoomOverlay.style.width = '0';
                 zoomOverlay.style.height = rect.height + 'px';
             }
         });
-        
+
         canvas.addEventListener('mousemove', (e) => {
             if (isSelecting && e.shiftKey) {
                 const rect = canvas.getBoundingClientRect();
                 const currentX = e.clientX - rect.left;
-                const width = Math.abs(currentX - selectionStart);
-                const left = Math.min(currentX, selectionStart);
-                
-                zoomOverlay.style.left = left + 'px';
-                zoomOverlay.style.width = width + 'px';
+                zoomOverlay.style.left = (canvas.offsetLeft + Math.min(currentX, selectionStart)) + 'px';
+                zoomOverlay.style.width = Math.abs(currentX - selectionStart) + 'px';
             }
         });
-        
+
         canvas.addEventListener('mouseup', (e) => {
             if (isSelecting && e.shiftKey) {
                 const rect = canvas.getBoundingClientRect();
                 const endX = e.clientX - rect.left;
-                
-                // Get X-axis values from pixel positions
                 const xScale = chartInstance.scales.x;
                 const xStart = xScale.getValueForPixel(Math.min(selectionStart, endX));
                 const xEnd = xScale.getValueForPixel(Math.max(selectionStart, endX));
-                
-                // Only zoom if selection is wide enough
+
                 if (Math.abs(endX - selectionStart) > 20) {
                     xAxisRange = { min: xStart, max: xEnd };
                     zoomControls.classList.add('visible');
                     updateChart();
                 }
-                
-                isSelecting = false;
-                zoomOverlay.style.display = 'none';
             }
+            isSelecting = false;
+            zoomOverlay.style.display = 'none';
         });
-        
+
         canvas.addEventListener('mouseleave', () => {
             if (isSelecting) {
                 isSelecting = false;
                 zoomOverlay.style.display = 'none';
             }
         });
-        
+
+        // ================================================================
+        // File loading
+        // ================================================================
         function handleFileSelect(e, type) {
             const file = e.target.files[0];
             if (file) {
                 processFile(file, type);
             }
         }
-        
+
         function processFile(file, type) {
             errorMsg.classList.remove('visible');
-            
+
             if (type === 'power') {
-                // Custom parsing for power CSV
                 const reader = new FileReader();
-                reader.onload = function(e) {
-                    const text = e.target.result;
-                    parsePowerCSV(text, file.name);
-                };
+                reader.onload = (e) => parsePowerCSV(e.target.result, file.name);
                 reader.readAsText(file);
-            } else {
-                Papa.parse(file, {
-                    header: true,
-                    dynamicTyping: false,
-                    skipEmptyLines: true,
-                    delimitersToGuess: [',', '\t', '|', ';'],
-                    complete: (results) => {
-                        const criticalErrors = results.errors.filter(e => e.type === 'Delimiter');
-                        if (criticalErrors.length > 0) {
-                            showError('Error parsing CSV: ' + criticalErrors[0].message);
-                            return;
-                        }
-                        
-                        csvData = results.data;
-                        const headers = Object.keys(csvData[0]);
-                        
-                        if (headers.length === 0) {
-                            showError('No columns found in CSV file');
-                            return;
-                        }
-                        
-                        populateAxisSelects(headers);
-                        showFileInfo(file.name, csvData.length, headers.length, 'primary');
-                        controls.classList.add('visible');
-                        uploadSection2.style.display = 'block';
-                        zoomInfo.classList.add('visible');
-                        updateChart();
-                    },
-                    error: (error) => {
-                        showError('Error reading file: ' + error.message);
-                    }
-                });
+                return;
             }
+
+            Papa.parse(file, {
+                header: true,
+                dynamicTyping: false,
+                skipEmptyLines: true,
+                delimitersToGuess: [',', '\t', '|', ';'],
+                complete: (results) => {
+                    const criticalErrors = results.errors.filter(e => e.type === 'Delimiter');
+                    if (criticalErrors.length > 0) {
+                        showError('Error parsing CSV: ' + criticalErrors[0].message);
+                        return;
+                    }
+
+                    const headers = (results.meta.fields || []).filter(h => h && h.trim() !== '');
+                    if (results.data.length === 0 || headers.length === 0) {
+                        showError('No columns found in CSV file');
+                        return;
+                    }
+
+                    csvData = results.data;
+                    csvHeaders = headers;
+                    fieldInfo = detectFieldTypes(csvData, headers);
+                    valueCache = new Map();
+                    timelineCache = { key: null, value: null };
+                    xAxisRange = null;
+                    zoomControls.classList.remove('visible');
+
+                    populateAxisSelects(headers);
+                    showFileInfo(file.name, csvData.length, headers.length, 'primary', typeSummary(headers));
+                    controls.classList.add('visible');
+                    uploadSection2.style.display = 'block';
+                    zoomInfo.classList.add('visible');
+                    updateChart();
+                },
+                error: (error) => {
+                    showError('Error reading file: ' + error.message);
+                }
+            });
         }
-        
+
         function parsePowerCSV(text, filename) {
             const lines = text.split('\n');
             const parsed = [];
-            
-            for (let line of lines) {
+            let dayOffset = 0;
+            let prevTod = null;
+
+            for (const line of lines) {
                 // Match lines like: (13:12:48.661),[0.5575747],OUTPUT,=,12.002,V,1.237,A
                 const match = line.match(/\((\d+):(\d+):(\d+\.\d+)\),\[([^\]]+)\],OUTPUT,=,([^,]+),V,([^,]+),A/);
-                if (match) {
-                    const hours = parseInt(match[1]);
-                    const minutes = parseInt(match[2]);
-                    const seconds = parseFloat(match[3]);
-                    const voltage = parseFloat(match[5]);
-                    const current = parseFloat(match[6]);
-                    const power = voltage * current;
-                    
-                    // Create timestamp for today with the time from the data
-                    const now = new Date();
-                    const timestamp = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 
-                                               hours, minutes, Math.floor(seconds), 
-                                               (seconds % 1) * 1000).getTime();
-                    
-                    parsed.push({
-                        timestamp: timestamp,
-                        voltage: voltage,
-                        current: current,
-                        power: power
-                    });
-                }
+                if (!match) continue;
+                const h = parseInt(match[1]);
+                const mi = parseInt(match[2]);
+                const s = parseFloat(match[3]);
+                const voltage = parseFloat(match[5]);
+                const current = parseFloat(match[6]);
+
+                // Detect midnight rollover (time of day jumps backwards by a lot)
+                const tod = (h * 3600 + mi * 60 + s) * 1000;
+                if (prevTod !== null && tod < prevTod - 3600e3) dayOffset++;
+                prevTod = tod;
+
+                parsed.push({ h, mi, s, dayOffset, voltage, current, power: voltage * current });
             }
-            
+
             if (parsed.length === 0) {
                 showError('No valid power data found in CSV');
                 return;
             }
-            
+
             powerData = parsed;
             showFileInfo(filename, parsed.length, 4, 'power');
             updateChart();
         }
-        
+
+        // The power log only records time of day; anchor it to the health log's first date.
+        function powerTimestamp(p, base) {
+            return new Date(base.getFullYear(), base.getMonth(), base.getDate() + p.dayOffset,
+                            p.h, p.mi, Math.floor(p.s), Math.round((p.s % 1) * 1000)).getTime();
+        }
+
+        // ================================================================
+        // Field type detection
+        // ================================================================
+        function isMissing(v) {
+            return v == null || MISSING.has(String(v).trim().toLowerCase());
+        }
+
+        // Returns ms since epoch, or NaN. Handles M/D/YYYY h:mm:ss [AM|PM] and ISO-like formats.
+        function parseDateTime(raw) {
+            const s = String(raw).trim();
+            let m = s.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?\s*(AM|PM)?$/i);
+            if (m) {
+                let month = +m[1], day = +m[2];
+                if (month > 12 && day <= 12) { const t = month; month = day; day = t; } // D/M/YYYY
+                let hour = +m[4];
+                if (m[8]) {
+                    const pm = m[8].toUpperCase() === 'PM';
+                    if (pm && hour < 12) hour += 12;
+                    if (!pm && hour === 12) hour = 0;
+                }
+                const ms = m[7] ? Math.round(parseFloat('0.' + m[7]) * 1000) : 0;
+                return new Date(+m[3], month - 1, day, hour, +m[5], m[6] ? +m[6] : 0, ms).getTime();
+            }
+            m = s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?(Z|[+-]\d{2}:?\d{2})?$/);
+            if (m) {
+                if (m[8]) return Date.parse(s.replace(' ', 'T'));
+                const ms = m[7] ? Math.round(parseFloat('0.' + m[7]) * 1000) : 0;
+                return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], m[6] ? +m[6] : 0, ms).getTime();
+            }
+            // Fallback for other textual date formats (never for plain numbers)
+            if (/[a-z]/i.test(s) && /\d{1,2}:\d{2}/.test(s)) {
+                const t = Date.parse(s);
+                return isNaN(t) ? NaN : t;
+            }
+            return NaN;
+        }
+
+        function inferUnit(name) {
+            for (const rule of UNIT_RULES) {
+                if (rule.re.test(name)) return { key: rule.key, label: rule.label, symbol: rule.symbol };
+            }
+            return null;
+        }
+
+        function unitLabel(unit) {
+            return unit.symbol ? `${unit.label} (${unit.symbol})` : unit.label;
+        }
+
+        function analyzeColumn(name, rows) {
+            let count = 0;
+            let isNum = true, isInt = true, isBool = true, isDate = true;
+            let dateChecked = 0;
+            const uniq = new Set();
+            let uniqOverflow = false;
+
+            for (let i = 0; i < rows.length; i++) {
+                const v = rows[i][name];
+                if (isMissing(v)) continue;
+                const s = String(v).trim();
+                count++;
+
+                if (isBool) {
+                    const l = s.toLowerCase();
+                    if (l !== 'true' && l !== 'false') isBool = false;
+                }
+                if (isNum) {
+                    if (!isFinite(Number(s))) isNum = false;
+                    else if (isInt && !/^[+-]?\d+$/.test(s)) isInt = false;
+                }
+                if (isDate && !isNum && dateChecked < 50) {
+                    if (isNaN(parseDateTime(s))) isDate = false;
+                    dateChecked++;
+                }
+                if (!uniqOverflow) {
+                    uniq.add(s);
+                    if (uniq.size > MAX_STATES) uniqOverflow = true;
+                }
+            }
+
+            const info = { name, kind: 'text', unit: null, states: null, constant: !uniqOverflow && uniq.size === 1 };
+            if (count === 0) {
+                info.kind = 'empty';
+            } else if (isBool) {
+                info.kind = 'boolean';
+            } else if (isNum) {
+                info.kind = isInt ? 'integer' : 'number';
+                info.unit = inferUnit(name);
+            } else if (isDate && dateChecked > 0) {
+                info.kind = 'datetime';
+            } else if (!uniqOverflow) {
+                info.kind = 'enum';
+                info.states = Array.from(uniq);  // first-appearance order
+                info.stateIndex = new Map(info.states.map((st, i) => [st, i]));
+            }
+            info.discrete = info.kind === 'boolean' || info.kind === 'enum';
+            info.plottable = info.discrete || info.kind === 'integer' || info.kind === 'number';
+            return info;
+        }
+
+        function detectFieldTypes(rows, headers) {
+            const out = {};
+            headers.forEach(h => { out[h] = analyzeColumn(h, rows); });
+            return out;
+        }
+
+        function typeTag(info) {
+            let tag;
+            switch (info.kind) {
+                case 'datetime': tag = 'timestamp'; break;
+                case 'boolean':  tag = 'boolean'; break;
+                case 'enum':     tag = `state: ${info.states.join('/')}`; break;
+                case 'integer':
+                case 'number':   tag = info.unit ? unitLabel(info.unit) : info.kind; break;
+                default:         tag = info.kind;
+            }
+            if (tag.length > 40) tag = tag.slice(0, 39) + '…';
+            return info.constant ? `${tag}, constant` : tag;
+        }
+
+        function typeSummary(headers) {
+            const counts = new Map();
+            headers.forEach(h => {
+                const info = fieldInfo[h];
+                let key;
+                if (info.kind === 'enum') key = 'state';
+                else if ((info.kind === 'integer' || info.kind === 'number') && info.unit) key = info.unit.label.toLowerCase();
+                else key = info.kind;
+                counts.set(key, (counts.get(key) || 0) + 1);
+            });
+            return Array.from(counts.entries())
+                .sort((a, b) => b[1] - a[1])
+                .map(([k, n]) => `${n} ${k}`)
+                .join(', ');
+        }
+
+        // Plottable numeric value for each row (NaN when missing).
+        // Booleans map to 0/1; states map to evenly spaced positions in [0, 1].
+        function getValues(col) {
+            if (valueCache.has(col)) return valueCache.get(col);
+            const info = fieldInfo[col];
+            const n = csvData.length;
+            const out = new Float64Array(n).fill(NaN);
+            for (let i = 0; i < n; i++) {
+                const v = csvData[i][col];
+                if (isMissing(v)) continue;
+                const s = String(v).trim();
+                switch (info.kind) {
+                    case 'datetime': out[i] = parseDateTime(s); break;
+                    case 'boolean':  out[i] = s.toLowerCase() === 'true' ? 1 : 0; break;
+                    case 'enum': {
+                        const idx = info.stateIndex.get(s);
+                        if (idx !== undefined) out[i] = statePosition(idx, info.states.length);
+                        break;
+                    }
+                    case 'integer':
+                    case 'number':   out[i] = Number(s); break;
+                }
+            }
+            valueCache.set(col, out);
+            return out;
+        }
+
+        function statePosition(idx, count) {
+            return count > 1 ? idx / (count - 1) : 0.5;
+        }
+
+        function stateLabel(info, y) {
+            if (info.kind === 'boolean') return y >= 0.5 ? 'True' : 'False';
+            const k = info.states.length;
+            const idx = k > 1 ? Math.round(y * (k - 1)) : 0;
+            return info.states[Math.max(0, Math.min(k - 1, idx))];
+        }
+
+        // ================================================================
+        // Collapsed time axis
+        //
+        // Rows are split into "sessions" wherever the timestamp jumps forward by more than
+        // the gap threshold (or backwards, e.g. a clock reset). Each session keeps its real
+        // duration on the axis; the idle time between sessions is replaced by a short fixed
+        // gap. Chart x values are these "virtual" positions; toReal() maps them back.
+        // ================================================================
+        function medianPositiveDiff(times) {
+            const diffs = [];
+            let prev = NaN;
+            for (let i = 0; i < times.length; i++) {
+                const t = times[i];
+                if (!isFinite(t)) continue;
+                if (isFinite(prev) && t > prev) diffs.push(t - prev);
+                prev = t;
+            }
+            if (diffs.length === 0) return 1000;
+            const sorted = Float64Array.from(diffs).sort();
+            return sorted[sorted.length >> 1];
+        }
+
+        function buildTimeline(times, mode) {
+            const n = times.length;
+            const medianDt = medianPositiveDiff(times);
+            const autoThreshold = Math.max(10 * medianDt, 30000);
+            const collapsed = mode !== 'off';
+            const threshold = mode === 'auto' ? autoThreshold : (collapsed ? Number(mode) : Infinity);
+
+            const segments = [];
+            const segOf = new Int32Array(n).fill(-1);
+            let cur = null;
+            let prev = NaN;
+            let monotonic = true;
+
+            for (let i = 0; i < n; i++) {
+                const t = times[i];
+                if (!isFinite(t)) continue;
+                const dt = t - prev;
+                if (cur && dt < 0) monotonic = false;
+                if (!cur || (collapsed && (dt > threshold || dt < 0))) {
+                    cur = { start: t, end: t };
+                    segments.push(cur);
+                } else {
+                    if (t > cur.end) cur.end = t;
+                    if (t < cur.start) cur.start = t;
+                }
+                segOf[i] = segments.length - 1;
+                prev = t;
+            }
+            if (segments.length === 0) return null;
+
+            // Width given to each collapsed gap: small, and never more than ~30% of the axis in total
+            let gapWidth = 0;
+            if (segments.length > 1) {
+                let active = 0;
+                segments.forEach(s => { active += s.end - s.start; });
+                gapWidth = Math.max(medianDt, active * Math.min(0.03, 0.3 / (segments.length - 1)));
+            }
+
+            let v = segments[0].start;
+            segments.forEach(s => {
+                s.vStart = v;
+                s.vEnd = v + (s.end - s.start);
+                v = s.vEnd + gapWidth;
+            });
+
+            const virtual = new Float64Array(n).fill(NaN);
+            for (let i = 0; i < n; i++) {
+                if (segOf[i] < 0) continue;
+                const s = segments[segOf[i]];
+                virtual[i] = s.vStart + (times[i] - s.start);
+            }
+
+            const gaps = [];
+            let idleTime = 0;
+            for (let i = 0; i < segments.length - 1; i++) {
+                const a = segments[i], b = segments[i + 1];
+                gaps.push({ vStart: a.vEnd, vEnd: b.vStart, from: a.end, to: b.start });
+                if (b.start > a.end) idleTime += b.start - a.end;
+            }
+
+            let segmentsSortedByStart = true;
+            for (let i = 1; i < segments.length; i++) {
+                if (segments[i].start < segments[i - 1].end) { segmentsSortedByStart = false; break; }
+            }
+
+            return {
+                segments, gaps, virtual, medianDt, autoThreshold, threshold, collapsed,
+                monotonic: collapsed || monotonic, segmentsSortedByStart, idleTime, tickStep: 60000
+            };
+        }
+
+        function getTimeline(col) {
+            const key = col + '|' + gapModeSelect.value;
+            if (timelineCache.key !== key) {
+                timelineCache = { key, value: buildTimeline(getValues(col), gapModeSelect.value) };
+            }
+            return timelineCache.value;
+        }
+
+        // Virtual axis position -> real timestamp (null when inside a collapsed gap)
+        function toReal(tl, v) {
+            const segs = tl.segments;
+            let lo = 0, hi = segs.length - 1, found = -1;
+            while (lo <= hi) {
+                const mid = (lo + hi) >> 1;
+                if (segs[mid].vStart <= v) { found = mid; lo = mid + 1; } else { hi = mid - 1; }
+            }
+            if (found < 0) return segs[0].start + (v - segs[0].vStart);
+            const s = segs[found];
+            if (v <= s.vEnd || found === segs.length - 1) return s.start + (v - s.vStart);
+            return null;
+        }
+
+        // Real timestamp -> virtual axis position (null when it falls inside a collapsed gap).
+        // Times before the first / after the last session extend those sessions.
+        function toVirtual(tl, t) {
+            if (!tl.collapsed) return t;
+            const segs = tl.segments;
+            const tol = tl.medianDt;
+            const first = segs[0], last = segs[segs.length - 1];
+            if (tl.segmentsSortedByStart) {
+                if (t < first.start) return first.vStart + (t - first.start);
+                if (t > last.end) return last.vStart + (t - last.start);
+                let lo = 0, hi = segs.length - 1, found = 0;
+                while (lo <= hi) {
+                    const mid = (lo + hi) >> 1;
+                    if (segs[mid].start - tol <= t) { found = mid; lo = mid + 1; } else { hi = mid - 1; }
+                }
+                const s = segs[found];
+                return t <= s.end + tol ? s.vStart + (t - s.start) : null;
+            }
+            for (const s of segs) {
+                if (t >= s.start - tol && t <= s.end + tol) return s.vStart + (t - s.start);
+            }
+            return null;
+        }
+
+        // True if a collapsed gap lies between two virtual x positions
+        function crossesGap(tl, a, b) {
+            if (!tl || tl.gaps.length === 0) return false;
+            if (a > b) { const t = a; a = b; b = t; }
+            const gaps = tl.gaps;
+            let lo = 0, hi = gaps.length - 1, found = -1;
+            while (lo <= hi) {
+                const mid = (lo + hi) >> 1;
+                if (gaps[mid].vStart >= a) { found = mid; hi = mid - 1; } else { lo = mid + 1; }
+            }
+            return found >= 0 && gaps[found].vEnd <= b;
+        }
+
+        function ceilToStep(t, step) {
+            const d = new Date(t);
+            d.setHours(0, 0, 0, 0);
+            if (step >= DAY) {
+                if (d.getTime() < t) d.setDate(d.getDate() + 1);
+                return d.getTime();
+            }
+            const sod = d.getTime();
+            return sod + Math.ceil((t - sod) / step) * step;
+        }
+
+        function addStep(t, step) {
+            if (step >= DAY) {
+                const d = new Date(t);
+                d.setDate(d.getDate() + Math.round(step / DAY));
+                return d.getTime();
+            }
+            return t + step;
+        }
+
+        // Generates "nice" time ticks inside each visible session (afterBuildTicks hook)
+        function buildTimeTicks(scale) {
+            const tl = activeTimeline;
+            if (!tl) return;
+            const min = scale.min, max = scale.max;
+            if (!(max > min)) return;
+            const width = scale.width || 800;
+            const segs = tl.segments;
+
+            const pieces = [];
+            let total = 0;
+            segs.forEach((s, i) => {
+                const a = i === 0 ? min : Math.max(s.vStart, min);
+                const b = i === segs.length - 1 ? max : Math.min(s.vEnd, max);
+                if (b < a) return;
+                pieces.push({ s, a, b });
+                total += b - a;
+            });
+            if (total <= 0) total = max - min;
+
+            const maxTicks = Math.max(2, Math.floor(width / 90));
+            let step = TIME_STEPS.find(st => total / st <= maxTicks);
+            if (!step) step = Math.ceil(total / maxTicks / DAY) * DAY;
+            tl.tickStep = step;
+
+            const pxPerUnit = width / (max - min);
+            const minSpacingPx = step >= DAY ? 85 : 80;   // roughly one label width
+            const placed = [];
+            const tryPlace = (v) => {
+                if (v < min || v > max) return;
+                for (const p of placed) {
+                    if (Math.abs(p - v) * pxPerUnit < minSpacingPx) return;
+                }
+                placed.push(v);
+            };
+            // Session starts first: they show when each startup happened
+            for (const p of pieces) {
+                if (p.s !== segs[0] && p.a === p.s.vStart) tryPlace(p.a);
+            }
+            // Then fill in "nice" round times inside each session
+            for (const p of pieces) {
+                const tStart = p.s.start + (p.a - p.s.vStart);
+                const tEnd = p.s.start + (p.b - p.s.vStart);
+                for (let t = ceilToStep(tStart, step); t <= tEnd; t = addStep(t, step)) {
+                    tryPlace(p.s.vStart + (t - p.s.start));
+                }
+            }
+            // Very short sessions may get no "nice" tick; label the window start instead
+            if (placed.length < 2 && pieces.length) tryPlace(pieces[0].a);
+            placed.sort((a, b) => a - b);
+            scale.ticks = placed.map(v => ({ value: v }));
+        }
+
+        function formatTimeTick(value, index, ticks) {
+            const tl = activeTimeline;
+            const t = toReal(tl, value);
+            if (t == null) return '';
+            const d = new Date(t);
+            const prevT = index > 0 ? toReal(tl, ticks[index - 1].value) : null;
+            const prev = prevT == null ? null : new Date(prevT);
+            const showYear = !prev || prev.getFullYear() !== d.getFullYear();
+            const dateStr = d.toLocaleDateString([], showYear
+                ? { month: 'short', day: 'numeric', year: 'numeric' }
+                : { month: 'short', day: 'numeric' });
+            if (tl.tickStep >= DAY) return dateStr;
+            const timeStr = d.toLocaleTimeString([], tl.tickStep < 60000
+                ? { hour: '2-digit', minute: '2-digit', second: '2-digit' }
+                : { hour: '2-digit', minute: '2-digit' });
+            if (!prev || prev.toDateString() !== d.toDateString()) {
+                return [timeStr, dateStr];
+            }
+            return timeStr;
+        }
+
+        function formatDuration(ms) {
+            if (ms < 0) return 'clock jump';
+            let s = Math.round(ms / 1000);
+            const d = Math.floor(s / 86400); s -= d * 86400;
+            const h = Math.floor(s / 3600);  s -= h * 3600;
+            const m = Math.floor(s / 60);    s -= m * 60;
+            if (d > 0) return `${d}d ${h}h`;
+            if (h > 0) return `${h}h ${m}m`;
+            if (m > 0) return `${m}m ${s}s`;
+            return `${s}s`;
+        }
+
+        // Draws a shaded band + dashed vertical line at every collapsed gap, with its duration
+        const gapMarkerPlugin = {
+            id: 'gapMarkers',
+            beforeDatasetsDraw(chart) {
+                const tl = activeTimeline;
+                if (!tl || !tl.gaps.length) return;
+                const { ctx, chartArea: area, scales: { x } } = chart;
+                ctx.save();
+                ctx.beginPath();
+                ctx.rect(area.left, area.top, area.right - area.left, area.bottom - area.top);
+                ctx.clip();
+                for (const g of tl.gaps) {
+                    const x0 = x.getPixelForValue(g.vStart);
+                    const x1 = x.getPixelForValue(g.vEnd);
+                    if (x1 < area.left || x0 > area.right) continue;
+                    ctx.fillStyle = 'rgba(100, 116, 139, 0.12)';
+                    ctx.fillRect(x0, area.top, x1 - x0, area.bottom - area.top);
+                    const xm = (x0 + x1) / 2;
+                    ctx.beginPath();
+                    ctx.setLineDash([6, 4]);
+                    ctx.lineWidth = 1.5;
+                    ctx.strokeStyle = '#64748b';
+                    ctx.moveTo(xm, area.top);
+                    ctx.lineTo(xm, area.bottom);
+                    ctx.stroke();
+                }
+                ctx.restore();
+            },
+            afterDatasetsDraw(chart) {
+                const tl = activeTimeline;
+                if (!tl || !tl.gaps.length) return;
+                const { ctx, chartArea: area, scales: { x } } = chart;
+                ctx.save();
+                ctx.font = '11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                ctx.textBaseline = 'middle';
+                ctx.textAlign = 'center';
+                let lastRight = -Infinity;
+                for (const g of tl.gaps) {
+                    const xm = (x.getPixelForValue(g.vStart) + x.getPixelForValue(g.vEnd)) / 2;
+                    if (xm < area.left || xm > area.right) continue;
+                    const text = formatDuration(g.to - g.from);
+                    const w = ctx.measureText(text).width + 8;
+                    const left = xm - w / 2;
+                    if (left < lastRight + 4) continue;   // avoid overlapping labels
+                    const y = area.top + 10;
+                    ctx.fillStyle = 'rgba(255, 255, 255, 0.92)';
+                    ctx.strokeStyle = '#94a3b8';
+                    ctx.lineWidth = 1;
+                    ctx.setLineDash([]);
+                    ctx.fillRect(left, y - 8, w, 16);
+                    ctx.strokeRect(left, y - 8, w, 16);
+                    ctx.fillStyle = '#334155';
+                    ctx.fillText(text, xm, y);
+                    lastRight = left + w;
+                }
+                ctx.restore();
+            }
+        };
+
+        // Tooltip interaction: the nearest point (by x) in every dataset that covers the cursor.
+        // Robust to datasets with different sample times (power log, decimation).
+        Chart.Interaction.modes.nearestPerDataset = function(chart, e) {
+            const area = chart.chartArea;
+            if (!area || e.x < area.left || e.x > area.right) return [];
+            const xScale = chart.scales.x;
+            const cursorV = xScale.getValueForPixel(e.x);
+            const items = [];
+            chart.data.datasets.forEach((ds, di) => {
+                if (!chart.isDatasetVisible(di)) return;
+                const els = chart.getDatasetMeta(di).data;
+                if (!els || els.length === 0) return;
+                let idx = -1;
+                if (seriesMeta[di] && seriesMeta[di].sorted) {
+                    if (e.x < els[0].x - 20 || e.x > els[els.length - 1].x + 20) return;
+                    let lo = 0, hi = els.length - 1;
+                    while (hi - lo > 1) {
+                        const mid = (lo + hi) >> 1;
+                        if (els[mid].x < e.x) lo = mid; else hi = mid;
+                    }
+                    idx = Math.abs(els[lo].x - e.x) <= Math.abs(els[hi].x - e.x) ? lo : hi;
+                } else {
+                    let best = Infinity;
+                    els.forEach((el, i) => {
+                        const dist = Math.abs(el.x - e.x);
+                        if (dist < best) { best = dist; idx = i; }
+                    });
+                    if (best > 30) return;
+                }
+                const el = els[idx];
+                if (!el || el.skip) return;
+                if (crossesGap(activeTimeline, cursorV, xScale.getValueForPixel(el.x))) return;
+                items.push({ element: el, datasetIndex: di, index: idx });
+            });
+            return items;
+        };
+
+        // ================================================================
+        // Axis selects
+        // ================================================================
         function populateAxisSelects(headers) {
             xAxisSelect.innerHTML = '';
             yAxisSelect.innerHTML = '';
-            
-            let defaultX = headers[0];
-            const dateTimeCol = headers.find(h => h.toLowerCase().includes('datetime') || h.toLowerCase().includes('time'));
-            if (dateTimeCol) defaultX = dateTimeCol;
-            
-            const tempColumns = headers.filter(h => h.toLowerCase().includes('temp'));
+
+            const xCandidates = headers.filter(h => ['datetime', 'integer', 'number'].includes(fieldInfo[h].kind));
+            let defaultX = headers.find(h => fieldInfo[h].kind === 'datetime') || xCandidates[0] || headers[0];
+
+            const tempColumns = headers.filter(h => fieldInfo[h].plottable && h.toLowerCase().includes('temp'));
             const defaultYColumns = [];
             if (tempColumns.length > 0) {
                 const iccdTemp = tempColumns.find(h => h.toLowerCase().includes('iccd'));
@@ -614,192 +1224,367 @@
                 if (baseplateTemp) defaultYColumns.push(baseplateTemp);
                 if (defaultYColumns.length === 0) defaultYColumns.push(tempColumns[0]);
             } else {
-                defaultYColumns.push(headers[1]);
+                const firstPlottable = headers.find(h => h !== defaultX && fieldInfo[h].plottable);
+                if (firstPlottable) defaultYColumns.push(firstPlottable);
             }
-            
-            headers.forEach(header => {
-                const optionX = document.createElement('option');
-                optionX.value = header;
-                optionX.textContent = header;
-                xAxisSelect.appendChild(optionX);
-                
-                const optionY = document.createElement('option');
-                optionY.value = header;
-                optionY.textContent = header;
-                if (defaultYColumns.includes(header)) {
-                    optionY.selected = true;
-                }
-                yAxisSelect.appendChild(optionY);
+
+            xCandidates.forEach(header => {
+                const opt = document.createElement('option');
+                opt.value = header;
+                opt.textContent = `${header}  ·  ${typeTag(fieldInfo[header])}`;
+                xAxisSelect.appendChild(opt);
             });
-            
+
+            headers.forEach(header => {
+                const info = fieldInfo[header];
+                if (info.kind === 'datetime') return;
+                const opt = document.createElement('option');
+                opt.value = header;
+                opt.textContent = `${header}  ·  ${typeTag(info)}`;
+                opt.disabled = !info.plottable;
+                if (defaultYColumns.includes(header)) opt.selected = true;
+                yAxisSelect.appendChild(opt);
+            });
+
             xAxisSelect.value = defaultX;
         }
-        
-        function updateChart() {
-            if (!csvData) return;
-            
-            const xColumn = xAxisSelect.value;
-            const yColumns = Array.from(yAxisSelect.selectedOptions).map(opt => opt.value);
-            
-            if (!xColumn || yColumns.length === 0) return;
-            
-            const isTimeAxis = xColumn.toLowerCase().includes('datetime') || xColumn.toLowerCase().includes('time');
-            
-            if (chartInstance) {
-                chartInstance.destroy();
+
+        // ================================================================
+        // Y axis building
+        // ================================================================
+        function formatNumber(v) {
+            if (Number.isInteger(v)) return String(v);
+            return String(parseFloat(v.toFixed(4)));
+        }
+
+        function groupKeyFor(info) {
+            if (info.discrete) return 'discrete';
+            if (info.unit) return 'unit:' + info.unit.key;
+            return info.kind;  // 'integer' | 'number'
+        }
+
+        // Title for one numeric axis that may hold one or more unit groups
+        function numericAxisTitle(seriesList) {
+            const groups = new Map();
+            seriesList.forEach(s => {
+                const k = groupKeyFor(s.info);
+                if (!groups.has(k)) groups.set(k, []);
+                groups.get(k).push(s);
+            });
+            const parts = [];
+            groups.forEach(members => {
+                const info = members[0].info;
+                if (info.unit) parts.push(unitLabel(info.unit));
+                else if (members.length === 1 && groups.size === 1) parts.push(members[0].name);
+                else parts.push(info.kind === 'integer' ? 'Value (integer)' : 'Value');
+            });
+            return parts.join(' / ');
+        }
+
+        function numericAxis(seriesList, position, isPrimary) {
+            let lo = Infinity, hi = -Infinity;
+            seriesList.forEach(s => {
+                if (s.visMin < lo) lo = s.visMin;
+                if (s.visMax > hi) hi = s.visMax;
+            });
+            const axis = {
+                type: 'linear',
+                position,
+                title: { display: true, text: numericAxisTitle(seriesList) },
+                grid: { drawOnChartArea: isPrimary },
+                ticks: { includeBounds: false }   // don't label the padded (non-round) ends
+            };
+            if (isFinite(lo) && isFinite(hi)) {
+                const range = hi - lo;
+                const buffer = range > 0 ? range * 0.1 : (Math.abs(hi) * 0.1 || 1);
+                axis.min = lo - buffer;
+                axis.max = hi + buffer;
             }
-            
-            const ctx = document.getElementById('chart').getContext('2d');
-            
-            // Color palette for multiple series
-            const colors = [
-                { border: '#667eea', bg: 'rgba(102, 126, 234, 0.1)' },
-                { border: '#06b6d4', bg: 'rgba(6, 182, 212, 0.1)' },
-                { border: '#10b981', bg: 'rgba(16, 185, 129, 0.1)' },
-                { border: '#8b5cf6', bg: 'rgba(139, 92, 246, 0.1)' },
-                { border: '#ec4899', bg: 'rgba(236, 72, 153, 0.1)' },
-                { border: '#f97316', bg: 'rgba(249, 115, 22, 0.1)' }
-            ];
-            
-            const datasets = [];
-            let allYValues = [];
-            
-            // Create datasets for each selected Y column
-            yColumns.forEach((yColumn, index) => {
-                const data = csvData.map((row, rowIndex) => {
-                    let xVal = row[xColumn];
-                    let yVal = row[yColumn];
-                    
-                    if (isTimeAxis) {
-                        const date = new Date(xVal);
-                        xVal = isNaN(date.getTime()) ? rowIndex : date.getTime();
-                    } else {
-                        xVal = parseFloat(xVal);
-                    }
-                    
-                    yVal = parseFloat(yVal);
-                    
-                    return { x: xVal, y: yVal };
-                }).filter(point => 
-                    point.x != null && 
-                    point.y != null && 
-                    !isNaN(point.x) && 
-                    !isNaN(point.y) &&
-                    isFinite(point.x) &&
-                    isFinite(point.y) &&
-                    // Filter by zoom range if active
-                    (!xAxisRange || (point.x >= xAxisRange.min && point.x <= xAxisRange.max))
-                );
-                
-                if (data.length > 0) {
-                    const colorIndex = index % colors.length;
-                    datasets.push({
-                        label: yColumn,
-                        data: data,
-                        borderColor: colors[colorIndex].border,
-                        backgroundColor: colors[colorIndex].bg,
-                        borderWidth: 2,
-                        pointRadius: currentChartType === 'scatter' ? 4 : 2,
-                        pointHoverRadius: 6,
-                        tension: 0.1,
-                        yAxisID: 'y'
-                    });
-                    
-                    allYValues.push(...data.map(d => d.y));
+            return axis;
+        }
+
+        // Booleans/states: lowest state sits 10% above the bottom, highest 10% below the top
+        function discreteAxis(seriesList, position, isPrimary) {
+            const posLabels = new Map();
+            const add = (pos, label) => {
+                if (!posLabels.has(pos)) posLabels.set(pos, new Set());
+                posLabels.get(pos).add(label);
+            };
+            seriesList.forEach(s => {
+                if (s.info.kind === 'boolean') {
+                    add(0, 'False');
+                    add(1, 'True');
+                } else {
+                    s.info.states.forEach((st, i) => add(statePosition(i, s.info.states.length), st));
                 }
             });
-            
-            if (allYValues.length === 0) {
-                showError('No valid data points found for selected columns');
-                return;
-            }
-            
-            // Calculate Y-axis range with 10% buffer for all series
-            const yMin = Math.min(...allYValues);
-            const yMax = Math.max(...allYValues);
-            const yRange = yMax - yMin;
-            const yBuffer = yRange * 0.1;
-            
-            const scales = {
-                x: {
-                    type: 'linear',
-                    title: {
-                        display: true,
-                        text: xColumn
-                    },
-                    min: xAxisRange ? xAxisRange.min : undefined,
-                    max: xAxisRange ? xAxisRange.max : undefined,
-                    ticks: isTimeAxis ? {
-                        callback: function(value) {
-                            const date = new Date(value);
-                            return date.toLocaleTimeString();
-                        }
-                    } : undefined
-                },
-                y: {
-                    type: 'linear',
-                    position: 'left',
-                    title: {
-                        display: true,
-                        text: yColumns.length === 1 ? yColumns[0] : 'Values'
-                    },
-                    min: yMin - yBuffer,
-                    max: yMax + yBuffer
+            const positions = Array.from(posLabels.keys()).sort((a, b) => a - b);
+            const allBool = seriesList.every(s => s.info.kind === 'boolean');
+            const title = allBool ? 'Boolean (True / False)'
+                        : seriesList.length === 1 ? seriesList[0].name
+                        : 'State';
+            return {
+                type: 'linear',
+                position,
+                min: -0.125,
+                max: 1.125,
+                title: { display: true, text: title },
+                grid: { drawOnChartArea: isPrimary },
+                afterBuildTicks: (scale) => { scale.ticks = positions.map(v => ({ value: v })); },
+                ticks: {
+                    callback: (value) => {
+                        const set = posLabels.get(value);
+                        if (!set) return '';
+                        const labels = Array.from(set);
+                        if (labels.length > 3) return '';
+                        const text = labels.join(' / ');
+                        return text.length > 28 ? text.slice(0, 27) + '…' : text;
+                    }
                 }
             };
-            
-            // Add power data if available
-            if (powerData && powerData.length > 0) {
-                const powerDataPoints = powerData.map(p => ({
-                    x: p.timestamp,
-                    y: p.power
-                })).filter(point => 
-                    !xAxisRange || (point.x >= xAxisRange.min && point.x <= xAxisRange.max)
-                );
-                
-                if (powerDataPoints.length > 0) {
-                    const powerValues = powerDataPoints.map(d => d.y);
-                    const powerMin = Math.min(...powerValues);
-                    const powerMax = Math.max(...powerValues);
-                    const powerRange = powerMax - powerMin;
-                    const powerBuffer = powerRange * 0.1;
-                    
-                    datasets.push({
-                        label: 'Power (W)',
-                        data: powerDataPoints,
-                        borderColor: '#f59e0b',
-                        backgroundColor: 'rgba(245, 158, 11, 0.1)',
-                        borderWidth: 2,
-                        pointRadius: currentChartType === 'scatter' ? 4 : 2,
-                        pointHoverRadius: 6,
-                        tension: 0.1,
-                        yAxisID: 'y2'
-                    });
-                    
-                    scales.y2 = {
-                        type: 'linear',
-                        position: 'right',
-                        title: {
-                            display: true,
-                            text: 'Power (W)'
-                        },
-                        min: powerMin - powerBuffer,
-                        max: powerMax + powerBuffer,
-                        grid: {
-                            drawOnChartArea: false
-                        }
-                    };
+        }
+
+        // ================================================================
+        // Chart
+        // ================================================================
+        function updateChart() {
+            if (!csvData) return;
+
+            const xColumn = xAxisSelect.value;
+            const yColumns = Array.from(yAxisSelect.selectedOptions).map(opt => opt.value);
+            if (!xColumn || yColumns.length === 0) return;
+
+            errorMsg.classList.remove('visible');
+            const notices = [];
+            const xInfo = fieldInfo[xColumn];
+            const isTimeAxis = xInfo.kind === 'datetime';
+
+            // ---- X positions ----
+            let xValues, timeline = null;
+            if (isTimeAxis) {
+                timeline = getTimeline(xColumn);
+                if (!timeline) {
+                    showError(`No valid timestamps found in ${xColumn}`);
+                    return;
+                }
+                xValues = timeline.virtual;
+                gapGroup.style.display = '';
+                gapModeSelect.options[0].textContent = `Auto (gaps longer than ${formatDuration(timeline.autoThreshold)})`;
+                gapSummary.textContent = timeline.collapsed
+                    ? `${timeline.segments.length} session${timeline.segments.length === 1 ? '' : 's'} · ` +
+                      `${timeline.gaps.length} gap${timeline.gaps.length === 1 ? '' : 's'} collapsed` +
+                      (timeline.gaps.length ? ` (${formatDuration(timeline.idleTime)} of idle time hidden)` : '')
+                    : 'Showing the true time scale; idle periods are not collapsed.';
+            } else {
+                xValues = getValues(xColumn);
+                gapGroup.style.display = 'none';
+            }
+            activeTimeline = timeline;
+
+            // Zoom ranges are only meaningful for the axis mapping they were made on
+            const rangeKey = isTimeAxis ? timelineCache.key : 'x|' + xColumn;
+            if (xAxisRangeKey !== rangeKey) {
+                xAxisRange = null;
+                zoomControls.classList.remove('visible');
+                xAxisRangeKey = rangeKey;
+            }
+            const sortedX = isTimeAxis && timeline.monotonic;
+            const inRange = (x) => !xAxisRange || (x >= xAxisRange.min && x <= xAxisRange.max);
+
+            // ---- Series ----
+            const series = [];
+            const skipped = [];
+
+            function finishSeries(s) {
+                let lo = Infinity, hi = -Infinity;
+                for (const p of s.data) {
+                    if (!inRange(p.x)) continue;
+                    if (p.y < lo) lo = p.y;
+                    if (p.y > hi) hi = p.y;
+                }
+                s.visMin = lo;
+                s.visMax = hi;
+                // When zoomed, keep one point either side of the window so lines reach the edges
+                if (xAxisRange) {
+                    if (s.sorted) {
+                        let a = 0;
+                        while (a < s.data.length && s.data[a].x < xAxisRange.min) a++;
+                        let b = s.data.length - 1;
+                        while (b >= 0 && s.data[b].x > xAxisRange.max) b--;
+                        s.data = s.data.slice(Math.max(0, a - 1), Math.min(s.data.length, b + 2));
+                    } else {
+                        s.data = s.data.filter(p => inRange(p.x));
+                    }
+                }
+                if (s.data.length > 0 && isFinite(lo)) series.push(s);
+            }
+
+            yColumns.forEach(col => {
+                const info = fieldInfo[col];
+                if (!info || !info.plottable) { skipped.push(col); return; }
+                const yValues = getValues(col);
+                const data = [];
+                for (let i = 0; i < yValues.length; i++) {
+                    const x = xValues[i], y = yValues[i];
+                    if (isFinite(x) && isFinite(y)) data.push({ x, y });
+                }
+                finishSeries({ name: col, info, data, sorted: sortedX, isPower: false });
+            });
+
+            if (powerData && powerData.length > 0 && isTimeAxis) {
+                const firstT = timeline.segments[0].start;
+                const base = isFinite(firstT) ? new Date(firstT) : new Date();
+                const data = [];
+                for (const p of powerData) {
+                    const v = toVirtual(timeline, powerTimestamp(p, base));
+                    if (v != null) data.push({ x: v, y: p.power });
+                }
+                finishSeries({
+                    name: 'Power (W)',
+                    info: { name: 'Power (W)', kind: 'number', unit: POWER_UNIT, discrete: false },
+                    data, sorted: timeline.monotonic, isPower: true
+                });
+            }
+
+            if (skipped.length) {
+                notices.push(`Not plottable (empty or free text): ${skipped.join(', ')}`);
+            }
+
+            if (chartInstance) {
+                chartInstance.destroy();
+                chartInstance = null;
+            }
+
+            if (series.length === 0) {
+                showNotice(notices);
+                showError('No valid data points found for selected columns');
+                chartContainer.classList.remove('visible');
+                return;
+            }
+
+            // ---- Axis assignment (at most two Y axes) ----
+            const discrete = series.filter(s => s.info.discrete);
+            const numeric = series.filter(s => !s.info.discrete);
+            const scales = {};
+
+            if (numeric.length && discrete.length) {
+                scales.y = numericAxis(numeric, 'left', true);
+                scales.y1 = discreteAxis(discrete, 'right', false);
+                numeric.forEach(s => { s.axis = 'y'; });
+                discrete.forEach(s => { s.axis = 'y1'; });
+                const groupCount = new Set(numeric.map(s => groupKeyFor(s.info))).size;
+                if (groupCount > 1) {
+                    notices.push('Several unit types plus booleans/states are selected; the numeric series share the left axis.');
+                }
+            } else if (discrete.length) {
+                scales.y = discreteAxis(discrete, 'left', true);
+                discrete.forEach(s => { s.axis = 'y'; });
+            } else {
+                const groups = new Map();
+                numeric.forEach(s => {
+                    const k = groupKeyFor(s.info);
+                    if (!groups.has(k)) groups.set(k, []);
+                    groups.get(k).push(s);
+                });
+                const groupList = Array.from(groups.values());
+                let left = groupList[0];
+                let right = groupList.slice(1).flat();
+                if (groupList.length > 2) {
+                    // Split unit groups into two axes at the largest jump in order of magnitude,
+                    // so groups with similar value ranges end up sharing an axis.
+                    const mags = groupList.map((members, i) => {
+                        let lo = Infinity, hi = -Infinity;
+                        members.forEach(s => { lo = Math.min(lo, s.visMin); hi = Math.max(hi, s.visMax); });
+                        const extent = Math.max(Math.abs(lo), Math.abs(hi), hi - lo, 1e-9);
+                        return { i, mag: Math.log10(extent) };
+                    }).sort((a, b) => a.mag - b.mag);
+                    let cut = 1, bestJump = -Infinity;
+                    for (let k = 1; k < mags.length; k++) {
+                        const jump = mags[k].mag - mags[k - 1].mag;
+                        if (jump > bestJump) { bestJump = jump; cut = k; }
+                    }
+                    const lowSide = new Set(mags.slice(0, cut).map(m => m.i));
+                    const firstOnLow = lowSide.has(0);
+                    left = groupList.filter((_, i) => lowSide.has(i) === firstOnLow).flat();
+                    right = groupList.filter((_, i) => lowSide.has(i) !== firstOnLow).flat();
+                }
+                scales.y = numericAxis(left, 'left', true);
+                left.forEach(s => { s.axis = 'y'; });
+                if (right.length) {
+                    scales.y1 = numericAxis(right, 'right', false);
+                    right.forEach(s => { s.axis = 'y1'; });
+                }
+                if (groupList.length > 2) {
+                    notices.push('More than two unit types are selected; unit types with similar value ranges share an axis.');
                 }
             }
-            
+
+            // ---- X axis ----
+            let xMin = Infinity, xMax = -Infinity;
+            series.forEach(s => {
+                for (const p of s.data) {
+                    if (p.x < xMin) xMin = p.x;
+                    if (p.x > xMax) xMax = p.x;
+                }
+            });
+            scales.x = {
+                type: 'linear',
+                title: { display: true, text: xColumn },
+                min: xAxisRange ? xAxisRange.min : xMin,
+                max: xAxisRange ? xAxisRange.max : xMax
+            };
+            if (isTimeAxis) {
+                scales.x.afterBuildTicks = buildTimeTicks;
+                scales.x.ticks = { autoSkip: false, maxRotation: 0, callback: formatTimeTick };
+                if (timeline.collapsed && timeline.gaps.length) {
+                    scales.x.title.text = `${xColumn} (idle gaps collapsed — dashed lines mark discontinuities)`;
+                }
+            }
+
+            // ---- Datasets ----
+            const isLine = currentChartType === 'line';
+            let totalPoints = 0;
+            series.forEach(s => { totalPoints += s.data.length; });
+            const dense = totalPoints / series.length > 2000;
+
+            let colorIdx = 0;
+            seriesMeta = [];
+            const datasets = series.map(s => {
+                const color = s.isPower ? POWER_COLOR : COLORS[colorIdx++ % COLORS.length];
+                seriesMeta.push({ info: s.info, sorted: s.sorted });
+                const ds = {
+                    label: s.name,
+                    data: s.data,
+                    borderColor: color.border,
+                    backgroundColor: color.bg,
+                    borderWidth: dense ? 1.5 : 2,
+                    pointRadius: currentChartType === 'scatter' ? (dense ? 1.5 : 4) : (dense ? 0 : 2),
+                    pointHoverRadius: 6,
+                    tension: s.info.discrete ? 0 : 0.1,
+                    yAxisID: s.axis
+                };
+                if (isLine && s.info.discrete) ds.stepped = 'after';
+                if (isLine && timeline && timeline.gaps.length) {
+                    // Don't draw connecting lines across a collapsed gap
+                    ds.segment = {
+                        borderColor: (ctx) => crossesGap(activeTimeline, ctx.p0.parsed.x, ctx.p1.parsed.x)
+                            ? 'rgba(0, 0, 0, 0)' : undefined
+                    };
+                }
+                return ds;
+            });
+
             const config = {
                 type: currentChartType,
-                data: { datasets: datasets },
+                data: { datasets },
+                plugins: [gapMarkerPlugin],
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
+                    parsing: false,
+                    animation: totalPoints > 10000 ? false : undefined,
                     interaction: {
-                        mode: 'index',
+                        mode: 'nearestPerDataset',
                         intersect: false
                     },
                     plugins: {
@@ -807,35 +1592,62 @@
                             display: true,
                             position: 'top'
                         },
+                        decimation: {
+                            enabled: isLine && sortedX,
+                            algorithm: 'min-max'
+                        },
                         tooltip: {
                             callbacks: {
-                                title: function(context) {
+                                title: (items) => {
+                                    if (!items.length) return '';
+                                    const x = items[0].parsed.x;
                                     if (isTimeAxis) {
-                                        const date = new Date(context[0].parsed.x);
-                                        return date.toLocaleString();
+                                        const t = toReal(timeline, x);
+                                        return t == null ? '' : new Date(t).toLocaleString();
                                     }
-                                    return context[0].parsed.x;
+                                    return `${xColumn}: ${formatNumber(x)}`;
+                                },
+                                label: (item) => {
+                                    const meta = seriesMeta[item.datasetIndex];
+                                    const y = item.parsed.y;
+                                    if (meta.info.discrete) return `${item.dataset.label}: ${stateLabel(meta.info, y)}`;
+                                    const sym = meta.info.unit && meta.info.unit.symbol ? ' ' + meta.info.unit.symbol : '';
+                                    return `${item.dataset.label}: ${formatNumber(y)}${sym}`;
                                 }
                             }
                         }
                     },
-                    scales: scales
+                    scales
                 }
             };
-            
-            chartInstance = new Chart(ctx, config);
+
+            chartInstance = new Chart(document.getElementById('chart').getContext('2d'), config);
             chartContainer.classList.add('visible');
+            showNotice(notices);
         }
-        
-        function showFileInfo(filename, rows, cols, type) {
+
+        function showFileInfo(filename, rows, cols, type, detail) {
             const info = type === 'power' ? fileInfo2 : fileInfo;
-            info.innerHTML = `
-                <p><strong>File:</strong> ${filename}</p>
-                <p><strong>Rows:</strong> ${rows} | <strong>Columns:</strong> ${cols}</p>
-            `;
+            info.innerHTML = '';
+            const add = (label, text) => {
+                const p = document.createElement('p');
+                const b = document.createElement('strong');
+                b.textContent = label + ' ';
+                p.appendChild(b);
+                p.appendChild(document.createTextNode(text));
+                info.appendChild(p);
+            };
+            add('File:', filename);
+            add('Rows:', `${rows} | Columns: ${cols}`);
+            if (detail) add('Detected fields:', detail);
             info.classList.add('visible');
         }
-        
+
+        function showNotice(messages) {
+            chartNotice.textContent = messages.join(' ');
+            chartNotice.classList.toggle('visible', messages.length > 0);
+        }
+
         function showError(message) {
             errorMsg.textContent = message;
             errorMsg.classList.add('visible');
